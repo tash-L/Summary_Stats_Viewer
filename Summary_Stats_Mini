@@ -1,0 +1,979 @@
+#Simple summary stats viewer based on Summary Stats Viewer, without transformed subsets
+#You will need to edit the filepaths (and maybe remove the study loop) as needed; esp dir_path and study_code
+
+#import packages
+import pandas as pd
+import xarray as xr
+import numpy as np
+from pandas.api.types import CategoricalDtype
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+#Function to display options in alphabetical grid format
+def display_options_grid(options, title="Options", columns=3):
+    """
+    Display options in alphabetical order in a grid format
+    Returns: (sorted_options, original_to_sorted_mapping)
+    """
+    print(f"\n{title}:")
+    
+    # Create sorted list with original indices
+    indexed_options = [(i, option) for i, option in enumerate(options)]
+    sorted_indexed = sorted(indexed_options, key=lambda x: x[1].lower())
+    
+    # Create mapping from new display number to original index
+    display_to_original = {}
+    
+    # Display in grid format
+    for i, (original_idx, option) in enumerate(sorted_indexed):
+        display_num = i + 1
+        display_to_original[display_num] = original_idx
+        
+        # Format option with number and pad for alignment
+        option_str = f"{display_num:2d}. {option}"
+        
+        # Print in columns
+        if (i + 1) % columns == 0 or i == len(sorted_indexed) - 1:
+            print(option_str)
+        else:
+            print(f"{option_str:<35}", end="  ")
+    
+    return display_to_original
+
+#create main loop, which remains in study until user requests to change or exits
+running_study = True
+while running_study:
+    
+    #create study list to choose from
+    directory_studies = Path('/terra/projects/heat_center/incoming/RP1/')
+    # List directories
+    study_list = [f.name for f in directory_studies.iterdir() if f.is_dir()]
+
+    #could exclude this section if not relevant
+    #Ask user to choose study code with grouped country display and error handling
+    while True:
+        # Group studies by country code (first 3 letters)
+        country_groups = {}
+        for study in study_list:
+            country_code = study[:3].upper() if len(study) >= 3 else "OTHER"
+            if country_code not in country_groups:
+                country_groups[country_code] = []
+            country_groups[country_code].append(study)
+        
+        # Sort countries and studies within each country
+        sorted_countries = sorted(country_groups.keys())
+        
+        # Create a single numbered list for selection while displaying by groups
+        display_mapping = {}
+        current_number = 1
+        
+        print("\nAvailable Studies (grouped by country):")
+        print("=" * 50)
+        
+        for country in sorted_countries:
+            studies_in_country = sorted(country_groups[country])
+            print(f"\n{country} Studies:")
+            print("-" * 15)
+            
+            # Display studies in this country in rows of 3
+            for i, study in enumerate(studies_in_country):
+                display_mapping[current_number] = study_list.index(study)
+                study_str = f"{current_number:2d}. {study}"
+                
+                # Print in columns of 3
+                if (i + 1) % 3 == 0 or i == len(studies_in_country) - 1:
+                    print(study_str)
+                else:
+                    print(f"{study_str:<20}", end="  ")
+                
+                current_number += 1
+        
+        try:
+            choice = int(input(f"\nEnter number that corresponds to study (1-{current_number-1}): "))
+            if 1 <= choice <= current_number - 1:
+                original_idx = display_mapping[choice]
+                studycode = study_list[original_idx]
+                break
+            else:
+                print(f"Invalid choice. Please enter a number between 1 and {current_number-1}.\n")
+        except (ValueError, KeyError):
+            print("Invalid input. Please enter a valid number.\n")
+
+    dir_path = ''
+    #create table list from study name to choose from
+    directory_tables = Path(dir_path + studycode + '/csv/')
+    # List all files
+    table_list = [f.name for f in directory_tables.iterdir() if f.is_file()]
+
+    #Ask user to choose table with grid display and error handling
+    while True:
+        display_mapping = display_options_grid(table_list, f"Available Tables in {studycode}")
+        try:
+            choice = int(input(f"\nEnter number that corresponds to table: "))
+            if 1 <= choice <= len(table_list):
+                original_idx = display_mapping[choice]
+                tablename = table_list[original_idx]
+                break
+            else:
+                print(f"Invalid choice. Please enter a number between 1 and {len(table_list)}.\n")
+        except (ValueError, KeyError):
+            print("Invalid input. Please enter a valid number.\n")
+
+    #read in data as dataframe df
+    df = pd.read_csv(dir_path + studycode + tablename, low_memory=False)
+
+    #summary stats for all variables
+    #print(df.describe)
+
+    #save List of column names
+    col_list_raw = list(df.columns)
+
+    #Ask user to identify participant IDs for both datasets
+    print("\n=== PARTICIPANT ID SELECTION ===")
+    
+    #List the variables (raw) for PID selection with grid display and error handling
+    while True:
+        display_mapping = display_options_grid(col_list_raw, "RAW Dataset Columns", columns=4)
+        try:
+            choice = int(input(f"\nEnter number for participant ID column in RAW dataset: "))
+            if 1 <= choice <= len(col_list_raw):
+                original_idx = display_mapping[choice]
+                studypid_raw = col_list_raw[original_idx]
+                break
+            else:
+                print(f"Invalid choice. Please enter a number between 1 and {len(col_list_raw)}.\n")
+        except (ValueError, KeyError):
+            print("Invalid input. Please enter a valid number.\n")
+
+    #Function definitions
+    #Function to check if a column can be converted to numeric
+    def is_potentially_numeric(series):
+        """
+        Check if a series can be converted to numeric, even if it's currently stored as object/string
+        Returns True if column is numeric or can be converted with >80% success rate
+        """
+        if pd.api.types.is_numeric_dtype(series):
+            return True
+        
+        # Try to convert to numeric and see if we get mostly valid numbers
+        try:
+            numeric_series = pd.to_numeric(series, errors='coerce')
+            # If more than 80% of non-null values are numeric, consider it numeric
+            non_null_count = series.notna().sum()
+            if non_null_count == 0:
+                return False
+            numeric_count = numeric_series.notna().sum()
+            return (numeric_count / non_null_count) >= 0.8
+        except:
+            return False
+
+    def normalize_missing_tokens(series):
+        """Coerce common string placeholders for missing values to actual NA"""
+        if not (pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series)):
+            return series
+        series_copy = series.copy()
+        string_mask = series_copy.map(lambda x: isinstance(x, str))
+        if not string_mask.any():
+            return series_copy
+        normalized_strings = series_copy[string_mask].str.strip().str.lower()
+        missing_tokens = {
+            "", "nan", "na", "n/a", "n.a.", "missing", "missing date", "unknown",
+            "not known", "none", "null", "not available", "not applicable", "-", "--",
+            "nill", "nil"
+        }
+        replace_mask = normalized_strings.isin(missing_tokens)
+        if replace_mask.any():
+            series_copy.loc[replace_mask[replace_mask].index] = pd.NA
+        return series_copy
+
+    #Function to check if a column contains datetime data
+    def is_datetime_variable(series):
+        #Check if a series contains datetime data or can be converted to datetime
+        #Returns dictionary with datetime info
+        
+        from datetime import datetime
+        
+        # If already datetime dtype, return True immediately
+        if pd.api.types.is_datetime64_any_dtype(series):
+            return {
+                "is_datetime": True, 
+                "datetime_format": "already_datetime",
+                "success_rate": 1.0,
+                "date_range": (series.min(), series.max())
+            }
+        
+        series_clean = normalize_missing_tokens(series)
+        non_null_series = series_clean[series_clean.notna()]
+        if len(non_null_series) == 0:
+            return {"is_datetime": False}
+        
+        # Pre-filter: Check if this could be numeric data first
+        # If it's potentially numeric, don't treat as datetime
+        if is_potentially_numeric(series_clean):
+            return {"is_datetime": False}
+        
+        # Additional pre-filters to avoid false positives
+        sample_values = non_null_series.head(10).astype(str)
+        
+        # Skip if values look like pure numbers (including decimals)
+        numeric_pattern_count = 0
+        for val in sample_values:
+            val_clean = str(val).strip()
+            # Check if it's just a number (integer or float)
+            try:
+                float(val_clean)
+                numeric_pattern_count += 1
+            except:
+                pass
+        
+        # If most sample values are pure numbers, probably not datetime
+        if numeric_pattern_count >= len(sample_values) * 0.8:
+            return {"is_datetime": False}
+        
+        # Check for datetime-like patterns in the strings
+        datetime_indicators = 0
+        for val in sample_values:
+            val_str = str(val).strip()
+            # Look for datetime separators and patterns
+            if any(sep in val_str for sep in ['-', '/', ':', ' ']):
+                # Additional checks for common datetime patterns
+                if (len(val_str) >= 6 and  # Minimum reasonable date length
+                    any(pattern in val_str.lower() for pattern in ['jan', 'feb', 'mar', 'apr', 'may', 'jun',
+                                                                   'jul', 'aug', 'sep', 'oct', 'nov', 'dec']) or
+                    ('/' in val_str and len(val_str.split('/')) in [2, 3]) or
+                    ('-' in val_str and len(val_str.split('-')) in [2, 3]) or
+                    (':' in val_str)):  # Time component
+                    datetime_indicators += 1
+        
+        # If no datetime-like patterns found, skip datetime detection
+        if datetime_indicators == 0:
+            return {"is_datetime": False}
+
+        # Extra heuristic: ISO-like date strings even with mixed content
+        if len(non_null_series) >= 5:
+            string_values = non_null_series.astype(str).str.strip()
+            iso_like = string_values.str.match(r'^\d{4}[-/]\d{2}[-/]\d{2}$')
+            if iso_like.sum() >= 5:
+                iso_conversion = pd.to_datetime(series_clean, errors='coerce')
+                valid_iso = iso_conversion.notna().sum()
+                if valid_iso >= 5:
+                    return {
+                        "is_datetime": True,
+                        "datetime_format": "iso_inferred",
+                        "success_rate": valid_iso / max(series_clean.notna().sum(), 1),
+                        "date_range": (iso_conversion.min(), iso_conversion.max()),
+                        "converted_series": iso_conversion
+                    }
+        
+        # Common datetime formats to try
+        datetime_formats = [
+            '%Y-%m-%d',           # 2023-01-15
+            '%d/%m/%Y',           # 15/01/2023
+            '%m/%d/%Y',           # 01/15/2023
+            '%Y-%m-%d %H:%M:%S',  # 2023-01-15 14:30:25
+            '%d/%m/%Y %H:%M',     # 15/01/2023 14:30
+            '%m/%d/%Y %H:%M',     # 01/15/2023 14:30
+            '%Y%m%d',             # 20230115
+            '%d-%m-%Y',           # 15-01-2023
+            '%m-%d-%Y',           # 01-15-2023
+            '%Y/%m/%d',           # 2023/01/15
+            '%d.%m.%Y',           # 15.01.2023
+            '%b %d, %Y',          # Jan 15, 2023
+            '%B %d, %Y',          # January 15, 2023
+            '%d %b %Y',           # 15 Jan 2023
+            '%d %B %Y',           # 15 January 2023
+        ]
+        
+        best_success_rate = 0
+        best_format = None
+        successful_conversions = None
+        
+        # Try pandas' flexible datetime parser first (with warning suppression)
+        try:
+            import warnings
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                test_conversion = pd.to_datetime(series_clean, errors='coerce')
+            
+            non_null_count = series_clean.notna().sum()
+            success_count = test_conversion.notna().sum()
+            success_rate = success_count / non_null_count if non_null_count > 0 else 0
+            
+            # Check if conversion was successful (allow lower rate if enough valid dates exist)
+            if success_rate >= 0.6 or (success_count >= 5 and success_rate >= 0.3):
+                valid_dates = test_conversion[test_conversion.notna()]
+                if len(valid_dates) > 0:
+                    min_year = valid_dates.min().year
+                    max_year = valid_dates.max().year
+                    # Check if dates are in a reasonable range (allow any year, just check max is not too far future)
+                    if max_year <= 2100:
+                        min_date = test_conversion.min()
+                        max_date = test_conversion.max()
+                        return {
+                            "is_datetime": True,
+                            "datetime_format": "auto_detected",
+                            "success_rate": success_rate,
+                            "date_range": (min_date, max_date),
+                            "converted_series": test_conversion
+                        }
+        except:
+            pass
+        
+        # Try specific formats if auto-detection didn't work well enough
+        for fmt in datetime_formats:
+            try:
+                import warnings
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", UserWarning)
+                    test_conversion = pd.to_datetime(series_clean, format=fmt, errors='coerce')
+                
+                non_null_count = series_clean.notna().sum()
+                success_count = test_conversion.notna().sum()
+                success_rate = success_count / non_null_count if non_null_count > 0 else 0
+                
+                if success_rate > best_success_rate:
+                    best_success_rate = success_rate
+                    best_format = fmt
+                    successful_conversions = test_conversion
+                    
+                if success_rate >= 0.6 or (success_count >= 5 and success_rate >= 0.3):  # Accept if enough valid dates
+                    # Additional validation: check date range reasonableness
+                    valid_dates = test_conversion[test_conversion.notna()]
+                    if len(valid_dates) > 0:
+                        min_year = valid_dates.min().year
+                        max_year = valid_dates.max().year
+                        if max_year <= 2100:
+                            min_date = test_conversion.min()
+                            max_date = test_conversion.max()
+                            return {
+                                "is_datetime": True,
+                                "datetime_format": fmt,
+                                "success_rate": success_rate,
+                                "date_range": (min_date, max_date),
+                                "converted_series": test_conversion
+                            }
+            except:
+                continue
+        
+        # If we found a reasonable conversion but not perfect, still consider it datetime
+        if best_success_rate >= 0.6 or (best_success_rate >= 0.3 and successful_conversions is not None and successful_conversions.notna().sum() >= 5):  # Lower threshold for edge cases when enough valid dates exist
+            # Final validation: check date range reasonableness
+            valid_dates = successful_conversions[successful_conversions.notna()]
+            if len(valid_dates) > 0:
+                min_year = valid_dates.min().year
+                max_year = valid_dates.max().year
+                if max_year <= 2100:
+                    min_date = successful_conversions.min()
+                    max_date = successful_conversions.max()
+                    return {
+                        "is_datetime": True,
+                        "datetime_format": best_format,
+                        "success_rate": best_success_rate,
+                        "date_range": (min_date, max_date),
+                        "converted_series": successful_conversions
+                    }
+        
+        return {"is_datetime": False}
+
+    #Enhanced variable type detection with datetime support
+    def detect_variable_type(series):
+        """
+        Detect if variable is datetime, binary, categorical, or other type
+        Returns: (type_name, additional_info)
+        """
+        # Ensure we're working with a Series, not a DataFrame
+        if isinstance(series, pd.DataFrame):
+            # If it's a DataFrame, take the first (and should be only) column
+            series = series.iloc[:, 0]
+        
+        series_clean = normalize_missing_tokens(series)
+        non_null_series = series_clean[series_clean.notna()]
+        if len(non_null_series) == 0:
+            return "empty", {}
+        
+        # Ensure unique_count is a scalar value - use len(unique()) for reliability
+        unique_count = len(non_null_series.unique())
+        
+        # Datetime detection - check first as strings might be datetime
+        datetime_info = is_datetime_variable(series_clean)
+        if datetime_info["is_datetime"]:
+            return "datetime", datetime_info
+        
+        # Special handling for small number of unique values that might be coded categories
+        # Check if this looks like coded categorical data before checking if it's numeric
+        if unique_count <= 10:  # Small number of unique values
+            
+            # Binary detection (exactly 2 unique values) - prioritize over numeric
+            if unique_count == 2:
+                values = list(non_null_series.unique())
+                values_lower = [str(v).lower() for v in values]
+                
+                # Check for common binary patterns (including numeric codes)
+                binary_patterns = [
+                    {"yes", "no"}, {"y", "n"}, {"true", "false"},
+                    {"male", "female"}, {"m", "f"}, {"1", "0"},
+                    {"1.0", "0.0"}, {"true", "false"}, {"positive", "negative"}
+                ]
+                
+                pattern_found = "custom"
+                for pattern in binary_patterns:
+                    if set(values_lower) == pattern:
+                        pattern_found = "/".join(sorted(pattern))
+                        break
+                
+                # Special check for 0/1 or 1/2 type coding
+                if set(values_lower) in [{"0", "1"}, {"1", "2"}, {"0.0", "1.0"}, {"1.0", "2.0"}]:
+                    pattern_found = "numeric_binary_coded"
+                
+                return "binary", {"values": values, "pattern": pattern_found}
+            
+            # Categorical with few categories (likely coded) - check before numeric
+            elif unique_count <= 10:
+                # Check if all values look like simple category codes
+                try:
+                    numeric_values = [float(str(v)) for v in non_null_series.unique()]
+                    # If they're all simple integers in a small range, likely categorical codes
+                    if all(v == int(v) for v in numeric_values) and max(numeric_values) - min(numeric_values) < 20:
+                        return "categorical_coded", {"unique_count": unique_count, "values": sorted(non_null_series.unique())}
+                except:
+                    pass
+                
+                return "categorical", {"unique_count": unique_count}
+        
+        # For variables with many unique values, check if it's potentially numeric
+        if is_potentially_numeric(series):
+            return "numeric", {"is_numeric": True}
+        
+        # Continue with regular categorical detection
+        
+        # Binary detection (exactly 2 unique values)
+        if unique_count == 2:
+            values = list(non_null_series.unique())
+            values_lower = [str(v).lower() for v in values]
+            
+            # Check for common binary patterns
+            binary_patterns = [
+                {"yes", "no"}, {"y", "n"}, {"true", "false"},
+                {"male", "female"}, {"m", "f"}, {"1", "0"}
+            ]
+            
+            pattern_found = "custom"
+            for pattern in binary_patterns:
+                if set(values_lower) == pattern:
+                    pattern_found = "/".join(sorted(pattern))
+                    break
+            
+            return "binary", {"values": values, "pattern": pattern_found}
+        
+        # Categorical detection (reasonable number of categories)
+        elif unique_count <= 20:
+            return "categorical", {"unique_count": unique_count}
+        
+        # High cardinality
+        else:
+            cardinality_pct = (unique_count / len(non_null_series)) * 100
+            if cardinality_pct > 95:
+                return "identifier", {"unique_count": unique_count, "cardinality_pct": cardinality_pct}
+            else:
+                return "high_cardinality", {"unique_count": unique_count, "cardinality_pct": cardinality_pct}
+    
+    #Binary variable visualization
+    def visualize_binary_variable(series, column_name):
+        """Create appropriate visualization for binary variables"""
+        counts = series.value_counts(dropna=False)
+        total_non_null = series.notna().sum()
+        
+        # Print counts with percentages
+        print(f"\nBinary counts for '{column_name}':")
+        for value, count in counts.items():
+            if pd.isna(value):
+                pct = (count / len(series)) * 100
+                print(f"  Missing: {count} ({pct:.1f}%)")
+            else:
+                pct = (count / total_non_null) * 100 if total_non_null > 0 else 0
+                print(f"  {value}: {count} ({pct:.1f}%)")
+        
+        # Create visualizations
+        non_null_counts = series.value_counts(dropna=True)
+        colors = ['lightcoral', 'lightskyblue']
+        
+        # Pie chart
+        plt.figure(figsize=(6, 5))
+        plt.pie(non_null_counts.values, labels=non_null_counts.index, 
+               autopct='%1.1f%%', colors=colors, startangle=90)
+        plt.title(f"Distribution of {column_name} (Binary)")
+        plt.axis('equal')
+        plt.show()
+        
+        # Bar chart with counts
+        plt.figure(figsize=(6, 4))
+        ax = non_null_counts.plot(kind='bar', color=colors)
+        plt.title(f"Counts for {column_name} (Binary)")
+        plt.xlabel("Values")
+        plt.ylabel("Count")
+        plt.xticks(rotation=0)
+        
+        # Add count labels on bars
+        for i, v in enumerate(non_null_counts.values):
+            ax.text(i, v + max(non_null_counts.values) * 0.01, str(v), 
+                    ha='center', va='bottom')
+        
+        plt.tight_layout()
+        plt.show()
+    
+    #Categorical variable visualization
+    def visualize_categorical_variable(series, column_name, unique_count, top_n=10):
+        """Create appropriate visualization for categorical variables"""
+        counts = series.value_counts(dropna=False)
+        total_non_null = series.notna().sum()
+        
+        # Print summary
+        print(f"\nCategorical summary for '{column_name}':")
+        print(f"  Total categories: {unique_count}")
+        print(f"  Most common: {counts.index[0]} ({counts.iloc[0]})" if len(counts) > 0 else "  No data")
+        
+        # Show top categories
+        display_n = min(top_n, len(counts))
+        print(f"\nTop {display_n} categories:")
+        
+        for i, (value, count) in enumerate(counts.head(display_n).items()):
+            if pd.isna(value):
+                pct = (count / len(series)) * 100
+                print(f"  {i+1}. Missing: {count} ({pct:.1f}%)")
+            else:
+                pct = (count / total_non_null) * 100 if total_non_null > 0 else 0
+                display_value = str(value)[:25] + "..." if len(str(value)) > 25 else str(value)
+                print(f"  {i+1}. {display_value}: {count} ({pct:.1f}%)")
+        
+        if len(counts) > display_n:
+            print(f"  ... and {len(counts) - display_n} other categories")
+        
+        # Create bar chart
+        plt.figure(figsize=(max(8, min(unique_count * 0.8, 12)), 5))
+        top_counts = counts.head(display_n)
+        ax = top_counts.plot(kind='bar', color='lightgreen')
+        
+        title = f"Top {display_n} Categories in {column_name}" if len(counts) > display_n else f"Distribution of {column_name}"
+        plt.title(title)
+        plt.xlabel("Categories")
+        plt.ylabel("Count")
+        plt.xticks(rotation=45, ha='right')
+        
+        # Add count labels on bars
+        for i, v in enumerate(top_counts.values):
+            ax.text(i, v + max(top_counts.values) * 0.01, str(v), 
+                    ha='center', va='bottom', fontsize=9)
+        
+        plt.tight_layout()
+        plt.show()
+
+    #Datetime variable visualization
+    def visualize_datetime_variable(series, column_name, datetime_info):
+        """Create appropriate visualization for datetime variables"""
+        # Convert to datetime if needed
+        if 'converted_series' in datetime_info:
+            dt_series = datetime_info['converted_series']
+        else:
+            dt_series = pd.to_datetime(series, errors='coerce')
+        
+        # For visualization we need valid dates, but we preserve information about missing values
+        dt_valid = dt_series[dt_series.notna()]
+        
+        if len(dt_valid) == 0:
+            print(f"\nNo valid datetime values found for '{column_name}'")
+            return
+        
+        # Print datetime summary
+        print(f"\nDatetime summary for '{column_name}':")
+        print(f"  Date format detected: {datetime_info.get('datetime_format', 'unknown')}")
+        print(f"  Conversion success rate: {datetime_info.get('success_rate', 0):.1%}")
+        print(f"  Valid dates: {len(dt_valid)}")
+        print(f"  Missing values: {len(series) - len(dt_valid)}")
+        print(f"  Date range: {dt_valid.min().strftime('%Y-%m-%d')} to {dt_valid.max().strftime('%Y-%m-%d')}")
+        
+        # Calculate time span
+        time_span = dt_valid.max() - dt_valid.min()
+        print(f"  Time span: {time_span.days} days ({time_span.days/365.25:.1f} years)")
+        
+        # Create visualizations based on time span and data density
+        if time_span.days > 365:  # More than a year
+            # Time series plot with monthly/yearly aggregation
+            plt.figure(figsize=(12, 6))
+            
+            # Create frequency plot
+            dt_valid_sorted = dt_valid.sort_values()
+            
+            # Subplot 1: Timeline distribution
+            plt.subplot(2, 1, 1)
+            plt.hist(dt_valid_sorted, bins=min(50, len(dt_valid)//10 + 1), alpha=0.7, color='skyblue', edgecolor='black')
+            plt.title(f"Distribution of {column_name} Over Time")
+            plt.xlabel("Date")
+            plt.ylabel("Frequency")
+            plt.xticks(rotation=45)
+            
+            # Subplot 2: Cumulative timeline
+            plt.subplot(2, 1, 2)
+            cumulative_counts = range(1, len(dt_valid_sorted) + 1)
+            plt.plot(dt_valid_sorted, cumulative_counts, color='red', linewidth=2)
+            plt.title(f"Cumulative Timeline for {column_name}")
+            plt.xlabel("Date")
+            plt.ylabel("Cumulative Count")
+            plt.xticks(rotation=45)
+            
+        else:  # Less than a year
+            # Detailed timeline with daily/weekly resolution
+            plt.figure(figsize=(12, 4))
+            plt.hist(dt_valid, bins=min(30, len(dt_valid)//5 + 1), alpha=0.7, color='lightgreen', edgecolor='black')
+            plt.title(f"Distribution of {column_name} (Detailed Timeline)")
+            plt.xlabel("Date")
+            plt.ylabel("Frequency")
+            plt.xticks(rotation=45)
+        
+        plt.tight_layout()
+        plt.show()
+        
+        # Additional analysis for patterns
+        if len(dt_valid) > 10:  # Only if we have enough data
+            # Day of week pattern
+            dow_counts = dt_valid.dt.day_name().value_counts()
+            if len(dow_counts) > 1:
+                plt.figure(figsize=(10, 4))
+                
+                # Subplot 1: Day of week
+                plt.subplot(1, 2, 1)
+                ordered_days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+                dow_ordered = dow_counts.reindex(ordered_days).fillna(0)
+                plt.bar(range(len(dow_ordered)), dow_ordered.values, color='orange', alpha=0.7)
+                plt.title(f"Day of Week Pattern\n({column_name})")
+                plt.xlabel("Day of Week")
+                plt.ylabel("Count")
+                plt.xticks(range(len(dow_ordered)), [day[:3] for day in ordered_days], rotation=45)
+                
+                # Subplot 2: Month pattern (if span > 1 month)
+                if time_span.days > 30:
+                    month_counts = dt_valid.dt.month_name().value_counts()
+                    plt.subplot(1, 2, 2)
+                    month_names = ['January', 'February', 'March', 'April', 'May', 'June',
+                                  'July', 'August', 'September', 'October', 'November', 'December']
+                    month_ordered = month_counts.reindex(month_names).fillna(0)
+                    plt.bar(range(len(month_ordered)), month_ordered.values, color='purple', alpha=0.7)
+                    plt.title(f"Month Pattern\n({column_name})")
+                    plt.xlabel("Month")
+                    plt.ylabel("Count")
+                    plt.xticks(range(len(month_ordered)), [month[:3] for month in month_names], rotation=45)
+                
+                plt.tight_layout()
+                plt.show()
+
+    #create loop to run through variables until user chooses to change study
+    running_variable = True
+    while running_variable:
+
+        #Ask user for variable name for summary stats (raw) with grid display and error handling
+        while True:
+            display_mapping = display_options_grid(col_list_raw, f"Variables in {tablename} (RAW)", columns=4)
+            try:
+                choice_input = input("\nEnter number that corresponds to variable for summary stats (or 'exit' to return to study selection): ")
+                if choice_input.lower().strip() == 'exit':
+                    running_variable = False
+                    break
+                choice = int(choice_input)
+                if 1 <= choice <= len(col_list_raw):
+                    original_idx = display_mapping[choice]
+                    variablename = col_list_raw[original_idx]
+                    break
+                else:
+                    print(f"Invalid choice. Please enter a number between 1 and {len(col_list_raw)}.\n")
+            except (ValueError, KeyError):
+                print("Invalid input. Please enter a valid number or 'exit'.\n")
+        
+        # If user chose to exit, break out of the variable loop
+        if not running_variable:
+            break
+            
+            # If user chose to exit, break out of the variable loop
+            if not running_variable:
+                break
+        
+        # Create subset dataframes with only participant ID and selected variable columns
+        # Keep all records including those with missing values for the selected variable
+        raw_subset = df[[studypid_raw, variablename]].copy()
+  
+        # VARIABLE TYPE DETECTION (before any processing)
+        print(f"\n=== VARIABLE TYPE DETECTION ===")
+        raw_var_type, raw_type_info = detect_variable_type(raw_subset[variablename])
+        
+        print(f"RAW variable '{variablename}': Detected as {raw_var_type.upper()}")
+        
+        #Check for duplicates in the selected variable subset and ask about deduplication
+        print(f"\n=== DUPLICATE CHECK FOR SELECTED VARIABLES ===")
+        
+        # Check duplicates in these subset dataframes based on participant ID
+        raw_duplicates = raw_subset.duplicated(subset=[studypid_raw]).sum()
+        
+        print(f"Duplicate participant IDs in variable subset dataframes:")
+        print(f"  RAW subset [{studypid_raw}, {variablename}]: {raw_duplicates} duplicates out of {len(raw_subset)} records")
+        
+        #Ask if user wants to deduplicate and create temporary analysis dataframes
+        deduplicate_yesno = 'n'
+        # Create temporary analysis dataframes (copies of main dataframes)
+        df_analysis = df.copy()
+        
+        if raw_duplicates > 0:
+            while True:
+                deduplicate_yesno = input(f"\nDo you want to deduplicate participant IDs for this variable analysis only? Enter 'y' or 'n': ").lower().strip()
+                if deduplicate_yesno in ['y', 'n']:
+                    break
+                else:
+                    print("Invalid input. Please enter 'y' for yes or 'n' for no.")
+            
+            if deduplicate_yesno == 'y':
+                # Deduplicate the subset dataframes based on participant IDs
+                original_raw_subset_count = len(raw_subset)
+                
+                # Deduplicate the subsets (keep first occurrence)
+                raw_subset_dedup = raw_subset.drop_duplicates(subset=[studypid_raw])
+                
+                new_raw_subset_count = len(raw_subset_dedup)
+                
+                # Note: Main analysis dataframes remain unchanged - only the subsets are deduplicated
+                # This preserves all records in the main datasets while removing duplicates from variable analysis
+                
+                print(f"\nTemporary deduplication applied for this variable analysis:")
+                print(f"  RAW subset: {original_raw_subset_count} → {new_raw_subset_count} records ({original_raw_subset_count - new_raw_subset_count} removed)")
+                print(f"  Analysis will use deduplicated data (main datasets unchanged)")
+            else:
+                print(f"\nDuplicates kept for this variable analysis.")
+        else:
+            print(f"\nNo duplicates found in variable subsets - proceeding without deduplication.")
+        
+        #Calculate % missingness from original dataframes (not analysis dataframes)
+        raw_missing_pct = df[variablename].isna().mean() * 100
+        
+        # Check if analysis dataframes are empty after deduplication
+        if len(df_analysis) == 0:
+            print(f"\nWARNING: No records remain in RAW analysis dataframe after deduplication!")
+        
+        #define remove outliers variable
+        removeoutliers_yesno = 'n'
+        #ask to remove outliers only if the variable is truly numerical (not binary/categorical coded)
+        if raw_var_type == "numeric":
+            #Ask if user wants to remove outliers
+            while True:
+                removeoutliers_yesno = input("\nDo you want to remove outliers for this variable analysis? y/n: ").lower().strip()
+                if removeoutliers_yesno in ['y', 'n']:
+                    break
+                else:
+                    print("Invalid input. Please enter 'y' for yes or 'n' for no.")
+            #define enhanced function to remove outliers
+            def remove_outliers_zscore(df_outliers, column, threshold=3):
+                """Enhanced outlier removal that handles string-to-numeric conversion"""
+                series = df_outliers[column]
+                
+                # Convert to numeric if needed
+                if not pd.api.types.is_numeric_dtype(series):
+                    numeric_series = pd.to_numeric(series, errors='coerce')
+                    # Create a mask for valid numeric values
+                    valid_mask = ~numeric_series.isna()
+                else:
+                    numeric_series = series
+                    valid_mask = ~series.isna()
+                
+                if valid_mask.sum() == 0:
+                    return df_outliers  # No valid numeric data
+                
+                # Calculate z-score only for valid numeric values
+                mean_val = numeric_series[valid_mask].mean()
+                std_val = numeric_series[valid_mask].std()
+                
+                if std_val == 0:
+                    return df_outliers  # No variation in data
+                
+                z_scores = abs((numeric_series - mean_val) / std_val)
+                
+                # Keep rows where z-score is acceptable OR where original data was non-numeric
+                keep_mask = (z_scores < threshold) | ~valid_mask
+                
+                return df_outliers[keep_mask]
+            
+            #Remove outliers if requested
+            if removeoutliers_yesno == 'y':
+                #call function to remove outliers from analysis dataframes only
+                original_raw_count = len(df_analysis)
+                
+                df_analysis = remove_outliers_zscore(df_analysis, variablename)
+                
+                new_raw_count = len(df_analysis)
+                
+                print(f"\nOutliers removed for this variable analysis:")
+                print(f"  RAW: {original_raw_count} → {new_raw_count} records ({original_raw_count - new_raw_count} outliers removed)")
+                print("  Main datasets unchanged\n")
+           
+        #define variable description function (summary stats and graphs, depending on data type)
+        def describe_variable(df_desc, column, top_n=10, bins=20):
+            # Check if dataframe is empty
+            if len(df_desc) == 0:
+                print(f"\n\n{column}: NO DATA AVAILABLE (empty dataframe)")
+                return pd.Series({'error': 'empty_dataframe'})
+            
+            series = df_desc[column]
+    
+            description = {}
+
+            #Basic info
+            description['dtype'] = series.dtype
+            description['n_obs'] = series.shape[0]
+            description['missing_count'] = series.isna().sum()
+            # Handle case where series is empty
+            if len(series) == 0:
+                description['missing_pct'] = 0
+                print(f"\n\n{column}: NO DATA AVAILABLE (empty series)")
+                return pd.Series(description)
+            else:
+                description['missing_pct'] = series.isna().mean() * 100
+    
+            # Variable type detection (single source of truth)
+            var_type, type_info = detect_variable_type(series)
+            description['variable_type'] = var_type
+            
+            #Display variable type and missingness
+            missing_pct = series.isna().mean() * 100
+            print(f"\n\n{column} dtype: {series.dtype} | Detected as: {var_type.upper()}")
+            print(f"{column} missingness: {missing_pct:.2f}%")
+            
+            # ALL VISUALIZATIONS AND ANALYSIS AFTER VARIABLE TYPE DETECTION
+            if var_type == "numeric":
+                # Numeric variables - handle conversion if needed
+                def is_series_numeric(series):
+                    """Check if series is numeric or can be converted to numeric"""
+                    if pd.api.types.is_numeric_dtype(series):
+                        return True, series
+                    
+                    # Try to convert to numeric
+                    try:
+                        numeric_series = pd.to_numeric(series, errors='coerce')
+                        non_null_original = series.notna().sum()
+                        if non_null_original == 0:
+                            return False, series
+                        non_null_converted = numeric_series.notna().sum()
+                        # If more than 80% can be converted, treat as numeric
+                        if (non_null_converted / non_null_original) >= 0.8:
+                            return True, numeric_series
+                        return False, series
+                    except:
+                        return False, series
+                
+                is_numeric, numeric_series = is_series_numeric(series)
+                if is_numeric:
+                    description['mean'] = numeric_series.mean()
+                    description['std_dev'] = numeric_series.std()
+                    description['min'] = numeric_series.min()
+                    description['max'] = numeric_series.max()
+                    description['conversion_needed'] = not pd.api.types.is_numeric_dtype(series)
+                    
+                    # Display numeric statistics
+                    print(f"\nNumeric Statistics:")
+                    print(f"  Mean: {numeric_series.mean():.3f}")
+                    print(f"  Std Dev: {numeric_series.std():.3f}")
+                    print(f"  Min: {numeric_series.min():.3f}")
+                    print(f"  Max: {numeric_series.max():.3f}")
+                    
+                    # Visualizations for numeric data (only plot valid values, but preserve missing info)
+                    valid_numeric = numeric_series[numeric_series.notna()]
+                    
+                    plt.figure(figsize=(5, 4))
+                    plt.boxplot(valid_numeric)
+                    plt.title(f"Box Plot of {column}")
+                    plt.ylabel(column)
+                    plt.show()
+                    
+                    plt.figure(figsize=(8, 4))
+                    valid_numeric.hist(bins=bins)
+                    plt.title(f"Frequency Histogram of {column}")
+                    plt.xlabel(column)
+                    plt.ylabel("Count")
+                    plt.show()
+            
+            elif var_type == "binary":
+                description['n_categories'] = series.nunique()  # Include all unique values including NaN
+                print(f"\nDetected as BINARY variable (pattern: {type_info.get('pattern', 'custom')})")
+                visualize_binary_variable(series, column)
+                
+            elif var_type == "datetime":
+                description['datetime_format'] = type_info.get('datetime_format', 'unknown')
+                description['success_rate'] = type_info.get('success_rate', 0)
+                print(f"\nDetected as DATETIME variable")
+                print(f"  Format: {type_info.get('datetime_format', 'unknown')}")
+                print(f"  Conversion success: {type_info.get('success_rate', 0):.1%}")
+                if 'date_range' in type_info and type_info['date_range'][0] is not pd.NaT:
+                    print(f"  Date range: {type_info['date_range'][0]} to {type_info['date_range'][1]}")
+                visualize_datetime_variable(series, column, type_info)
+                
+            elif var_type == "categorical":
+                description['n_categories'] = series.nunique()  # Include all unique values including NaN
+                unique_count = type_info['unique_count']
+                print(f"\nDetected as CATEGORICAL variable")
+                visualize_categorical_variable(series, column, unique_count, top_n)
+                
+            elif var_type == "categorical_coded":
+                description['n_categories'] = series.nunique()  # Include all unique values including NaN
+                unique_count = type_info['unique_count']
+                values = type_info['values']
+                print(f"\nDetected as CATEGORICAL CODED variable (numeric codes: {values})")
+                print("  → Numbers used as category labels, not quantities")
+                visualize_categorical_variable(series, column, unique_count, top_n)
+                
+            elif var_type == "high_cardinality":
+                description['n_categories'] = series.nunique()  # Include all unique values including NaN
+                unique_count = type_info['unique_count']
+                cardinality_pct = type_info['cardinality_pct']
+                print(f"\nDetected as HIGH CARDINALITY categorical ({unique_count} categories, {cardinality_pct:.1f}% unique)")
+                visualize_categorical_variable(series, column, unique_count, top_n=15)
+                
+            elif var_type == "identifier":
+                description['n_categories'] = series.nunique()  # Include all unique values including NaN
+                unique_count = type_info['unique_count']
+                cardinality_pct = type_info['cardinality_pct']
+                print(f"\nDetected as IDENTIFIER variable ({unique_count} unique values, {cardinality_pct:.1f}% unique)")
+                print("  → This appears to be an ID field or unique identifier")
+                # Just show basic counts, no visualization
+                counts = series.value_counts(dropna=False).head(5)
+                print(f"\nSample values (top 5):")
+                for value, count in counts.items():
+                    print(f"  {value}: {count}")
+            
+            # Store additional info from type detection
+            description.update(type_info)
+  
+            return pd.Series(description)
+    
+        #call variable description function
+        print(f"\n\n=== ANALYSIS: {variablename} (RAW) ===")
+        print(f"Study: {studycode} | Deduplicated: {deduplicate_yesno} | Outliers removed: {removeoutliers_yesno}")
+        describe_variable(df_analysis, variablename)
+        
+        #Ask to loop back to variable selection else go to study selection question
+        while True:
+            cont_var = input("\nDescribe another variable? y/n: ").lower().strip()
+            if cont_var in ['y', 'n']:
+                break
+            else:
+                print("Invalid input. Please enter 'y' for yes or 'n' for no.")
+        
+        if cont_var == 'y':
+            running_variable = True
+        else:
+            running_variable = False
+
+    #Ask to loop back to study selection else end programme
+    while True:
+        cont = input("\nChoose another study y/n: ").lower().strip()
+        if cont in ['y', 'n']:
+            break
+        else:
+            print("Invalid input. Please enter 'y' for yes or 'n' for no.")
+    
+    if cont == 'y':
+        running_study = True
+    else:
+        running_study = False
